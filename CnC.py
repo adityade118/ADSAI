@@ -1,215 +1,192 @@
 # ------------------- CnC.py -------------------
 import time
-import json
 import os
+import json
 import google.generativeai as genai
 from dotenv import load_dotenv
 
+# -------- Load environment and configure Gemini --------
 load_dotenv()
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# -------- Setup Gemini --------
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+# Use the faster but accurate Gemini model
 GEMINI_MODEL = "models/gemini-2.5-flash"
+gemini = genai.GenerativeModel(GEMINI_MODEL)
 
-# -------- Model answer structure --------
-MODEL_ANSWER = [
-    {"id": "b1", "text": "Quicksort average-case is O(n log n)"},
-    {"id": "b2", "text": "Quicksort worst-case is O(n^2)"},
-    {"id": "b3", "text": "Pivot choice determines partition quality"},
-]
 
-# -------- Tunable thresholds --------
-FOLLOWUP_COOLDOWN = 30  # seconds between follow-ups per bullet
+# -------- Session Management Class --------
+class CnCSession:
+    def __init__(self, question_id, question_text, model_answer, tags=None, subtags=None):
+        self.question_id = question_id
+        self.question_text = question_text
+        self.model_answer = model_answer
+        self.tags = tags or []
+        self.subtags = subtags or []
 
-# -------- Gemini prompt templates --------
-UNCERTAINTY_PROMPT = """
-You are analyzing a transcript segment from a technical interview.
-Determine if the speaker seems confident, uncertain, or admits not knowing.
+        self.topics = []
+        self.covered = set()
+        self.uncovered = set()
 
-Return JSON with a single key "state" whose value is one of:
-["knows", "uncertain", "does_not_know"].
+        self.transcript = []
+        self.followups = []
+        self.start_time = time.time()
+        self.end_time = None
 
-Transcript:
-\"\"\"{text}\"\"\"
+        self._initialize_topics()
 
-Return JSON only.
-"""
+    # -------- Internal: Split model answer into conceptual points --------
+    def _initialize_topics(self):
+        prompt = f"""
+        You are an expert interviewer.
+        Break the following model answer into a numbered list of atomic conceptual points.
+        Each point should be one self-contained idea that can be verified independently.
 
-COVERAGE_PROMPT = """
-You are evaluating whether the following bullet point has been fully addressed
-in the candidate's complete answer.
+        Model answer:
+        {self.model_answer}
+        """
+        try:
+            response = gemini.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,
+                    candidate_count=1,
+                ),
+            )
+            text = response.text.strip()
+            self.topics = [line.split(".", 1)[-1].strip() for line in text.splitlines() if "." in line]
+            self.uncovered = set(range(len(self.topics)))
+            print(f"\n[Session {self.question_id}] Initialized {len(self.topics)} key points.")
+        except Exception as e:
+            print("[Gemini initialization error]", e)
+            self.topics = []
 
-Bullet point:
-"{bullet}"
+    # -------- Helper: Gemini-based coverage classifier (binary, decisive) --------
+    def _classify_coverage(self, bullet_text, full_answer):
+        COVERAGE_PROMPT = f"""
+        You are a strict evaluator determining if a candidate's answer covers a bullet point.
 
-Candidate's full answer so far:
-\"\"\"{answer}\"\"\"
+        Label only as "covered" or "uncovered" — never partial, uncertain, or maybe.
 
-Classify as one of: ["covered", "partial", "incomplete"].
+        Interpret natural speech variations:
+        - "O of n log n" = "O(n log n)"
+        - "ex" = "e^x"
+        - "exponential of x" = "e^x"
+        Focus on conceptual correctness, not phrasing.
 
-You are judging whether each point has been covered by the candidate's answer. 
-Mark as:
-- COMPLETE: The idea is clearly or **implicitly covered, even with different wording**.
-- PARTIAL: The idea is touched upon but lacks clarity or completeness.
-- INCOMPLETE: The idea is missing or wrong.
+        Respond only in valid JSON like:
+        {{"status": "covered"}} or {{"status": "uncovered"}}.
 
-Be forgiving to rephrasings like "O of n log n" vs "log-linear time".
+        Bullet: "{bullet_text}"
+        Candidate answer:
+        \"\"\"{full_answer}\"\"\"
+        """
 
-Be tolerant of spoken variations like:
-- "O of n square" instead of O(n^2)
-- "split into halves" instead of "divide recursively"
-- "exponential n" instead of "O(exp n)"
-
-Examples:
-Bullet: "Quicksort average-case is O(n log n)"
-Answer: "Quicksort takes roughly n log n time on average" -> return complete
-Bullet: "Quicksort worst-case is O(n^2)"
-Answer: "It can degrade if the pivot is bad" -> partial
-Bullet: "Pivot choice determines partition quality"
-Answer: "Choosing the pivot carefully matters" -> complete
-
-Return JSON: {{"status": "<one of covered/partial/incomplete>"}}.
-
-"""
-
-# ---------------- Gemini Helpers ----------------
-def call_gemini(prompt):
-    """Base Gemini API call with minimal error handling."""
-    try:
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        print("Gemini error:", e)
-        return "{}"
-
-def detect_uncertainty_gemini(text):
-    """Detect whether the speaker sounds confident, uncertain, or doesn't know."""
-    prompt = UNCERTAINTY_PROMPT.format(text=text)
-    out = call_gemini(prompt)
-    try:
-        result = json.loads(out)
-        return result.get("state", "knows")
-    except Exception:
-        return "knows"
-
-def classify_coverage_gemini(bullet_text, full_answer):
-    """Gemini-based classification for completeness per bullet."""
-    prompt = COVERAGE_PROMPT.format(bullet=bullet_text, answer=full_answer)
-    out = call_gemini(prompt)
-    try:
-        data = json.loads(out)
-        return data.get("status", "incomplete")
-    except Exception:
-        return "incomplete"
-
-# --------- Global State Machines ---------
-BULLET_STATE = {b["id"]: "uncovered" for b in MODEL_ANSWER}
-LAST_FOLLOWUP_TIME = {b["id"]: 0 for b in MODEL_ANSWER}
-FULL_TRANSCRIPT = []
-
-# ---------------- State Management ----------------
-def recompute_coverage_with_gemini(full_answer):
-    """
-    Evaluate all bullet points for completeness using the entire transcript.
-    Directly updates BULLET_STATE.
-    """
-    summary = {}
-    for b in MODEL_ANSWER:
-        status = classify_coverage_gemini(b["text"], full_answer)
-        BULLET_STATE[b["id"]] = status
-        summary[b["id"]] = status
-    return summary
-
-def update_states(coverage_summary, last_followup, transcript):
-    """
-    Incorporate uncertainty cues for the most recent segment.
-    """
-    gem_state = detect_uncertainty_gemini(transcript)
-    if last_followup:
-        bid = last_followup["bullet_id"]
-        if gem_state == "does_not_know":
-            BULLET_STATE[bid] = "skipped"
-        elif gem_state == "uncertain":
-            BULLET_STATE[bid] = "pending"
-        elif gem_state == "knows" and BULLET_STATE[bid] != "covered":
-            BULLET_STATE[bid] = "uncovered"
-
-def select_followup(coverage_summary, last_followup):
-    """
-    Select one relevant follow-up question per cycle, prioritizing partially
-    covered points, enforcing cooldowns, and avoiding repetition.
-    """
-    now = time.time()
-    candidates = []
-
-    # Prioritize partially covered points
-    for b in MODEL_ANSWER:
-        bid = b["id"]
-        if coverage_summary.get(bid) == "partial":
-            candidates.append((bid, b))
-    # Then incomplete ones
-    for b in MODEL_ANSWER:
-        bid = b["id"]
-        if coverage_summary.get(bid) == "incomplete":
-            candidates.append((bid, b))
-
-    for bid, b in candidates:
-        if BULLET_STATE[bid] in ["uncovered", "pending", "partial", "incomplete"]:
-            if last_followup and last_followup["bullet_id"] == bid:
-                continue  # skip repeating same follow-up
-            if now - LAST_FOLLOWUP_TIME[bid] < FOLLOWUP_COOLDOWN:
-                continue  # respect cooldown
-            LAST_FOLLOWUP_TIME[bid] = now
-            BULLET_STATE[bid] = "pending"
-            return {
-                "bullet_id": bid,
-                "text": f"You haven’t clearly covered this point yet: '{b['text']}'. Could you elaborate?"
-            }
-
-    return None
-
-# ---------------- Main Pipeline ----------------
-def run_pipeline(transcript_queue):
-    """
-    Continuously consume interview transcript segments and
-    generate context-aware follow-ups.
-    """
-    buffer = []
-    last_followup = None
-    last_time = time.time()
-
-    while True:
-        index, text = transcript_queue.get()
-        buffer.append(text)
-        FULL_TRANSCRIPT.append(text)
-
-        now = time.time()
-        # Evaluate periodically (every 20s or 3 utterances)
-        if now - last_time > 20 or len(buffer) >= 3:
-            utterance = " ".join(buffer)
-            print("\n[PIPELINE] Evaluating segment:")
-            print(utterance)
-
-            # Full answer context
-            full_answer = " ".join(FULL_TRANSCRIPT)
-
-            # Step 1: Recompute completeness
-            coverage_summary = recompute_coverage_with_gemini(full_answer)
-
-            # Step 2: Update based on confidence
-            update_states(coverage_summary, last_followup, utterance)
-
-            # Step 3: Generate follow-up if needed
-            followup = select_followup(coverage_summary, last_followup)
-            if followup:
-                print("[PIPELINE] Follow-up:")
-                print("->>", followup["text"])
-                last_followup = followup
-                FULL_TRANSCRIPT.append(f"[FOLLOW-UP] {followup['text']}")
+        try:
+            response = gemini.generate_content(
+                COVERAGE_PROMPT,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,     # deterministic
+                    top_p=0.8,
+                    candidate_count=1,
+                ),
+            )
+            text = response.text.strip()
+            if "{" in text and "}" in text:
+                json_part = text[text.index("{") : text.rindex("}") + 1]
+                data = json.loads(json_part)
+                status = data.get("status", "uncovered").lower()
             else:
-                print("[PIPELINE] No new follow-ups needed.")
+                status = "uncovered"
+        except Exception as e:
+            print("[Gemini coverage error]", e)
+            status = "uncovered"
 
-            print("[STATE]", BULLET_STATE)
-            buffer.clear()
-        last_time = now
+        return status
+
+    # -------- Update coverage with new transcript chunk --------
+    def update_with_transcript(self, chunk_text):
+        self.transcript.append(chunk_text)
+        full_answer = " ".join(self.transcript)
+
+        # Re-evaluate coverage only for still-uncovered topics
+        for i, topic in enumerate(self.topics):
+            if i in self.covered:
+                continue
+            status = self._classify_coverage(topic, full_answer)
+            if status == "covered":
+                self.covered.add(i)
+                self.uncovered.discard(i)
+            else:
+                self.uncovered.add(i)
+
+        return {
+            "covered": [self.topics[i] for i in self.covered],
+            "uncovered": [self.topics[i] for i in self.uncovered],
+        }
+
+    # -------- Suggest one follow-up question --------
+    def generate_followup(self):
+        if not self.uncovered:
+            return None
+
+        uncovered_points = [self.topics[i] for i in self.uncovered]
+        prompt = f"""
+        These ideas have not been discussed yet:
+        {uncovered_points}
+
+        Ask ONE concise, natural follow-up question to help the candidate
+        cover one of the above points. Keep it conversational and short.
+        """
+
+        try:
+            response = gemini.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.3,  # Slight creativity for follow-up phrasing
+                    top_p=0.9,
+                ),
+            )
+            question = response.text.strip()
+            self.followups.append(question)
+            self.transcript.append(f"Follow-up asked: {question}")
+            return question
+        except Exception as e:
+            print("[Gemini follow-up error]", e)
+            return None
+
+    # -------- Compute final session score --------
+    def finalize(self):
+        self.end_time = time.time()
+        score = 100 * len(self.covered) / len(self.topics) if self.topics else 0
+
+        report = {
+            "question_id": self.question_id,
+            "question_text": self.question_text,
+            "tags": self.tags,
+            "subtags": self.subtags,
+            "score": round(score, 2),
+            "covered_points": [self.topics[i] for i in self.covered],
+            "missed_points": [self.topics[i] for i in self.uncovered],
+            "followups": self.followups,
+            "transcript": self.transcript,
+            "duration_sec": round(self.end_time - self.start_time, 2),
+        }
+
+        print(f"\n[Session {self.question_id}] Final Score: {score:.2f}%")
+        return report
+
+
+# -------- Helper: Store session results --------
+def save_session_report(report, path="session_history.json"):
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                history = json.load(f)
+        else:
+            history = []
+        history.append(report)
+        with open(path, "w") as f:
+            json.dump(history, f, indent=2)
+        print(f"[Saved] Session {report['question_id']} -> {path}")
+    except Exception as e:
+        print("[Error saving report]", e)
